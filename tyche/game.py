@@ -6,16 +6,9 @@ from tyche.hand import Hand
 class Game:
     """
     Represents and manages a single game of Texas Hold'em.
+    This class is designed to run "quietly" and return results.
     """
     def __init__(self, players, small_blind=5, big_blind=10):
-        """
-        Initializes a Game.
-
-        Args:
-            players (list): A list of Player objects.
-            small_blind (int): The amount of the small blind.
-            big_blind (int): The amount of the big_blind.
-        """
         self.players = players
         self.small_blind = small_blind
         self.big_blind = big_blind
@@ -26,122 +19,101 @@ class Game:
 
     def play_hand(self):
         """
-        Plays one complete hand of Texas Hold'em.
+        Plays one complete hand of Texas Hold'em and returns the result.
         """
-        print("="*10 + " Starting a New Hand " + "="*10)
-
-        # 1. Reset players and deck for the new hand
         self._reset_for_new_hand()
         active_players = self._get_active_players()
         if len(active_players) < 2:
-            print("Not enough players to continue.")
-            return
+            return None # Not enough players
 
-        # 2. Post blinds
-        self._post_blinds(active_players)
-        print(f"Pot after blinds: {self.pot}")
+        self._post_blinds()
+        self._deal_hole_cards()
 
-        # 3. Deal hole cards
-        self._deal_hole_cards(active_players)
+        # Run betting rounds for each stage of the game
+        for stage in ["preflop", "flop", "turn", "river"]:
+            if len(self._get_active_players()) > 1:
+                if stage != "preflop":
+                    self._deal_community_cards(3 if stage == "flop" else 1)
+                self._run_betting_round()
 
-        # 4. Pre-flop betting round
-        self._run_betting_round()
-        if len(self._get_active_players()) == 1:
-            self._award_pot_to_winner()
-            return
+        # Determine the outcome
+        final_players = self._get_active_players()
+        if len(final_players) == 1:
+            result = self._award_pot_to_last_player(final_players[0])
+        else:
+            result = self._handle_showdown(final_players)
 
-        # 5. Flop
-        self._deal_community_cards("Flop", 3)
-        self._run_betting_round()
-        if len(self._get_active_players()) == 1:
-            self._award_pot_to_winner()
-            return
-
-        # 6. Turn
-        self._deal_community_cards("Turn", 1)
-        self._run_betting_round()
-        if len(self._get_active_players()) == 1:
-            self._award_pot_to_winner()
-            return
-
-        # 7. River
-        self._deal_community_cards("River", 1)
-        self._run_betting_round()
-        if len(self._get_active_players()) == 1:
-            self._award_pot_to_winner()
-            return
-
-        # 8. Showdown
-        self._handle_showdown()
+        # Update player stacks based on the result
+        winners = [p for p in self.players if p.name in result['winners']]
+        if winners:
+            pot_share = self.pot // len(winners)
+            for winner in winners:
+                winner.stack += pot_share
 
         # Move dealer button for the next hand
         self.dealer_pos = (self.dealer_pos + 1) % len(self.players)
 
-    def _run_betting_round(self):
-        """Manages a full round of betting."""
-        active_players = self._get_active_players()
-        if not active_players: return
+        return result
 
-        # Pre-flop starts left of BB, post-flop starts left of dealer
+    def _run_betting_round(self):
+        active_players = self._get_active_players()
+        if not active_players or len(active_players) == 1: return
+
         start_pos = (self.dealer_pos + 3) % len(self.players) if not self.community_cards else (self.dealer_pos + 1) % len(self.players)
 
-        current_bet = self.big_blind if not self.community_cards else 0
+        # Find the first active player to start the action
+        while not self.players[start_pos].is_active:
+            start_pos = (start_pos + 1) % len(self.players)
+
+        current_bet = max(p.current_bet for p in self.players)
         last_raiser = None
-        players_in_round = len(active_players)
-        players_acted = 0
+        action_count = 0
 
-        while players_acted < players_in_round:
-            player_pos = (start_pos + players_acted) % len(self.players)
-            player = self.players[player_pos]
+        player_index = start_pos
 
-            if not player.is_active:
-                players_acted +=1
-                continue
+        while action_count < len(active_players):
+            player = self.players[player_index]
 
-            bet_to_call = current_bet - player.current_bet
-            action = player.make_decision(self.community_cards, bet_to_call, self.big_blind)
-            print(f"{player.name} ({player.stack}) chooses to {action}")
+            if player.is_active:
+                if player is last_raiser: # Full circle after a raise, round ends
+                    break
 
-            if action.action_type == ActionType.FOLD:
-                player.is_active = False
-            elif action.action_type == ActionType.CHECK:
-                pass # Only valid if bet_to_call is 0
-            elif action.action_type == ActionType.CALL:
-                amount = min(bet_to_call, player.stack)
-                self._process_bet(player, amount)
-            elif action.action_type == ActionType.BET:
-                amount = min(action.amount, player.stack)
-                self._process_bet(player, amount)
-                current_bet = player.current_bet
-                last_raiser = player
-                players_in_round = len(self._get_active_players()) # Reset for players to react to new bet
-                players_acted = 0 # Start the loop again from the next player
-            elif action.action_type == ActionType.RAISE:
-                amount = min(bet_to_call + action.amount, player.stack)
-                self._process_bet(player, amount)
-                current_bet = player.current_bet
-                last_raiser = player
-                players_in_round = len(self._get_active_players())
-                players_acted = 0 # Reset for players to react to new raise
+                bet_to_call = current_bet - player.current_bet
+                action = player.make_decision(self.community_cards, bet_to_call, self.big_blind)
 
-            players_acted += 1
+                is_aggressive_action = False
+                if action.action_type == ActionType.FOLD:
+                    player.is_active = False
+                elif action.action_type == ActionType.CALL:
+                    self._process_bet(player, bet_to_call)
+                elif action.action_type == ActionType.BET:
+                    self._process_bet(player, action.amount)
+                    current_bet = player.current_bet
+                    last_raiser = player
+                    is_aggressive_action = True
+                elif action.action_type == ActionType.RAISE:
+                    # Amount to process is the call amount + the raise amount
+                    self._process_bet(player, bet_to_call + action.amount)
+                    current_bet = player.current_bet
+                    last_raiser = player
+                    is_aggressive_action = True
 
-            # If a raise happened, the original raiser must be the last to act
-            if player is last_raiser:
-                break
+                if is_aggressive_action:
+                    action_count = 0 # Reset so everyone gets to act again
 
-        # Reset player bets for the next round
-        for p in self.players:
-            p.current_bet = 0
+            action_count += 1
+            player_index = (player_index + 1) % len(self.players)
+
+        # Reset player bets for the next street
+        for p in self.players: p.current_bet = 0
 
     def _process_bet(self, player, amount):
-        """Helper to move chips from player to pot."""
-        player.stack -= amount
-        player.current_bet += amount
-        self.pot += amount
+        actual_amount = min(amount, player.stack)
+        player.stack -= actual_amount
+        player.current_bet += actual_amount
+        self.pot += actual_amount
 
     def _reset_for_new_hand(self):
-        """Resets the game state for a new hand."""
         self.deck = Deck()
         self.community_cards = []
         self.pot = 0
@@ -149,88 +121,51 @@ class Game:
             player.reset_for_new_hand()
 
     def _get_active_players(self):
-        """Returns a list of players still in the hand."""
         return [p for p in self.players if p.is_active and p.stack > 0]
 
-    def _post_blinds(self, active_players):
-        """Posts small and big blinds."""
+    def _post_blinds(self):
         sb_pos = (self.dealer_pos + 1) % len(self.players)
-        bb_pos = (self.dealer_pos + 2) % len(self.players)
+        while not self.players[sb_pos].is_active: sb_pos = (sb_pos + 1) % len(self.players)
+
+        bb_pos = (sb_pos + 1) % len(self.players)
+        while not self.players[bb_pos].is_active: bb_pos = (bb_pos + 1) % len(self.players)
 
         sb_player = self.players[sb_pos]
-        sb_amount = min(self.small_blind, sb_player.stack)
-        self._process_bet(sb_player, sb_amount)
-        print(f"{sb_player.name} posts small blind of {sb_amount}")
+        self._process_bet(sb_player, self.small_blind)
 
         bb_player = self.players[bb_pos]
-        bb_amount = min(self.big_blind, bb_player.stack)
-        self._process_bet(bb_player, bb_amount)
-        print(f"{bb_player.name} posts big blind of {bb_amount}")
+        self._process_bet(bb_player, self.big_blind)
 
-    def _deal_hole_cards(self, active_players):
-        """Deals two cards to each active player."""
-        for player in active_players:
+    def _deal_hole_cards(self):
+        for player in self._get_active_players():
             player.hand = [self.deck.deal(), self.deck.deal()]
-        # In a real game, you wouldn't print this!
-        for p in active_players: print(f"Dealt {p.hand} to {p.name}")
 
-    def _deal_community_cards(self, stage_name, num_cards):
-        """Deals community cards for flop, turn, or river."""
+    def _deal_community_cards(self, num_cards):
         self.deck.deal()  # Burn a card
-        new_cards = [self.deck.deal() for _ in range(num_cards)]
-        self.community_cards.extend(new_cards)
-        print(f"\n--- {stage_name}: {self.community_cards} --- (Pot: {self.pot})")
+        self.community_cards.extend([self.deck.deal() for _ in range(num_cards)])
 
-    def _award_pot_to_winner(self):
-        """Awards the pot to the last remaining player."""
-        winners = self._get_active_players()
-        if len(winners) == 1:
-            winner = winners[0]
-            print(f"\n{winner.name} wins the pot of {self.pot}!")
-            winner.stack += self.pot
-            self.pot = 0
+    def _award_pot_to_last_player(self, winner):
+        return {
+            "winners": [winner.name],
+            "winning_hand": "Folds",
+            "pot": self.pot
+        }
 
-    def _handle_showdown(self):
-        """Handles the showdown to determine the winner by comparing hands."""
-        print("\n--- Showdown ---")
-        active_players = self._get_active_players()
-        if not active_players:
-            return
-
-        if len(active_players) == 1:
-            self._award_pot_to_winner()
-            return
-
-        # Evaluate and store each player's best hand
+    def _handle_showdown(self, active_players):
         player_hands = []
         for player in active_players:
-            # The Hand class automatically finds the best 5-card hand from the 7 available cards
             hand = Hand(player.hand, self.community_cards)
             player_hands.append((player, hand))
-            print(f"{player.name} shows {player.hand} for a final hand of {hand.get_rank_name()}")
 
-        # Sort players by hand strength (best hand first)
         player_hands.sort(key=lambda x: x[1], reverse=True)
-
-        # Determine winner(s)
         best_hand = player_hands[0][1]
-        winners = [ph for ph in player_hands if ph[1] == best_hand]
+        winners = [ph[0] for ph in player_hands if ph[1] == best_hand]
 
-        # Award the pot
-        if len(winners) == 1:
-            winner, winning_hand = winners[0]
-            print(f"\n{winner.name} wins the pot of {self.pot} with a {winning_hand.get_rank_name()}!")
-            winner.stack += self.pot
-        else:
-            # Handle split pot
-            pot_share = self.pot // len(winners)
-            winner_names = ", ".join([w[0].name for w in winners])
-            winning_rank_name = winners[0][1].get_rank_name()
-            print(f"\nSplit pot! {winner_names} share the pot of {self.pot} with a {winning_rank_name}.")
-            for winner, _ in winners:
-                winner.stack += pot_share
-
-        self.pot = 0
+        return {
+            "winners": [w.name for w in winners],
+            "winning_hand": best_hand.get_rank_name(),
+            "pot": self.pot
+        }
 
     def __repr__(self):
         return f"Game(players={[p.name for p in self.players]})"
